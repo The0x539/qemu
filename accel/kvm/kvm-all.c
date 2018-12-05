@@ -53,7 +53,7 @@
  */
 #define PAGE_SIZE getpagesize()
 
-//#define DEBUG_KVM
+#define DEBUG_KVM 1
 
 #ifdef DEBUG_KVM
 #define DPRINTF(fmt, ...) \
@@ -71,8 +71,73 @@ struct KVMParkedVcpu {
     QLIST_ENTRY(KVMParkedVcpu) node;
 };
 
-struct KVMState
-{
+typedef enum {
+    HRT_IDLE         = 0,
+    HRT_CALL         = 1,
+    HRT_PARCALL      = 2,
+    HRT_SYNCSETUP    = 3,
+    HRT_SYNC         = 4,
+    HRT_SYNCTEARDOWN = 5,
+    HRT_MERGE        = 6,
+    HRT_GDTSYNC      = 7,
+} trans_state_t;
+
+
+typedef enum {
+    HRT_BLOB,
+    HRT_ELF64,
+    HRT_MBOOT2,
+    HRT_MBOOT64,
+} hrt_type_t;
+
+struct KVMROSSignal {
+    unsigned long code;
+    unsigned long cr3;
+    unsigned long handler;
+    unsigned long stack;
+};
+
+
+struct KVMHvmState {
+    int is_hvm;
+    unsigned first_hrt_core;
+    unsigned long first_hrt_gpa;
+    void * hrt_image;
+    unsigned long hrt_img_size;
+    unsigned long hrt_entry_addr;
+
+    hrt_type_t type;
+
+    unsigned long hrt_flags;
+    unsigned long max_mem_mapped;
+    unsigned long gva_offset;
+    unsigned long gva_entry;
+    unsigned long comm_page_gpa;
+    unsigned long hrt_int_vec;
+
+    void * comm_page_hpa;
+    void * comm_page_hva;
+
+    trans_state_t trans_state;
+
+    unsigned long trans_count;
+
+#if 0
+    struct kvm_ros_event ros_event;
+#endif
+    struct KVMROSSignal ros_signal;
+
+
+    unsigned long hrt_gdt_gva;
+    unsigned long ros_fsbase;
+};
+
+struct KVMCoreHvm {
+    unsigned is_hrt;
+    unsigned long last_boot_start;
+};
+
+struct KVMState { 
     AccelState parent_obj;
 
     int nr_slots;
@@ -1520,6 +1585,12 @@ bool kvm_vcpu_id_is_valid(int vcpu_id)
     return vcpu_id >= 0 && vcpu_id < kvm_max_vcpu_id(s);
 }
 
+static int kvm_hvm_init(void) 
+{
+    DPRINTF("init HVM\n");
+    return 0;
+}
+
 static int kvm_init(MachineState *ms)
 {
     MachineClass *mc = MACHINE_GET_CLASS(ms);
@@ -1745,6 +1816,8 @@ static int kvm_init(MachineState *ms)
         qemu_balloon_inhibit(true);
     }
 
+    kvm_hvm_init();
+
     return 0;
 
 err:
@@ -1764,6 +1837,115 @@ void kvm_set_sigmask_len(KVMState *s, unsigned int sigmask_len)
 {
     s->sigmask_len = sigmask_len;
 }
+
+
+static const char * hvm_hcall_names[]  = {
+    "null hypercall",
+    "reset ROS request",
+    "reset HRT request",
+    "reset ROS + HRT request",
+    "HRT image replacement request",
+    "HRT state request",
+    "ROS event request",
+    "ACK result",
+    "ROS event completion",
+    "invoke function request",
+    "invoke parallel function request",
+    "setup synchronization",
+    "teardown syncrhonization",
+    "function execution complete",
+    "address space merge request",
+    "address space unmerge request",
+    "address space merge completion",
+    "update signal handler",
+    "raise signal to ROS",
+    "request to fill HRT GDT",
+    "request to register HRT GDT",
+    "request to restore HRT GDT",
+    "GDT synchronization complete",
+};
+
+typedef enum {
+    HVM_HCALL_NULL = 0,
+    HVM_HCALL_RESET_ROS,
+    HVM_HCALL_RESET_HRT,
+    HVM_HCALL_RESET_BOTH,
+    HVM_HCALL_HRT_STATE,
+    HVM_HCALL_ROS_EVENT_REQ,
+    HVMN_HCALL_ACK_RES,
+    HVM_HCALL_ROS_EVENT_COMP,
+    HVM_HCALL_INVOKE_FUNC,
+    HVM_HCALL_INVOKE_PAR_FUNC,
+    HVM_HCALL_SETUP_SYNC,
+    HVM_HCALL_TEARDOWN_SYNC,
+    HVM_HCALL_FUNC_COMPLETE,
+    HVM_HCALL_ASPACE_MERGE,
+    HVM_HCALL_ASPACE_UNMERGE,
+    HVM_HCALL_MERGE_DONE,
+    HVM_HCALL_UPDATE_SIG_HANDLER,
+    HVM_HCALL_RAISE_SIG_TO_ROS,
+    HVM_HCALL_FILL_GDT,
+    HVM_HCALL_REG_GDT,
+    HVM_HCALL_RESTORE_GDT,
+    HVM_HCALL_GDT_SYNC_DONE,
+    HVM_NUM_HCALLS,
+} hcall_nr_t;
+
+
+static void dump_hvm_hcall_info(struct kvm_run * run)
+{
+    int i;
+    DPRINTF("Got hypercall [%s]: (nr=%llu, longmode=%d, ret=%llu)\n",
+            hvm_hcall_names[run->hypercall.nr],
+            run->hypercall.nr,
+            run->hypercall.longmode,
+            run->hypercall.ret);
+
+    DPRINTF("  Args:\n");
+    
+    for (i = 0; i < 6; i++) {
+        DPRINTF("    [%d] = %llx\n", i, run->hypercall.args[i]);
+    }
+}
+
+
+static int kvm_handle_hvm_hcall(struct kvm_run * run)
+{
+
+    switch (run->hypercall.nr) {
+        case HVM_HCALL_NULL:
+        case HVM_HCALL_RESET_ROS:
+        case HVM_HCALL_RESET_HRT:
+        case HVM_HCALL_RESET_BOTH:
+        case HVM_HCALL_HRT_STATE:
+        case HVM_HCALL_ROS_EVENT_REQ:
+        case HVMN_HCALL_ACK_RES:
+        case HVM_HCALL_ROS_EVENT_COMP:
+        case HVM_HCALL_INVOKE_FUNC:
+        case HVM_HCALL_INVOKE_PAR_FUNC:
+        case HVM_HCALL_SETUP_SYNC:
+        case HVM_HCALL_TEARDOWN_SYNC:
+        case HVM_HCALL_FUNC_COMPLETE:
+        case HVM_HCALL_ASPACE_MERGE:
+        case HVM_HCALL_ASPACE_UNMERGE:
+        case HVM_HCALL_MERGE_DONE:
+        case HVM_HCALL_UPDATE_SIG_HANDLER:
+        case HVM_HCALL_RAISE_SIG_TO_ROS:
+        case HVM_HCALL_FILL_GDT:
+        case HVM_HCALL_REG_GDT:
+        case HVM_HCALL_RESTORE_GDT:
+        case HVM_HCALL_GDT_SYNC_DONE:
+            dump_hvm_hcall_info(run);
+            break;
+        default:
+            DPRINTF("Unknown HVM hypercall (%llx)\n", 
+                    run->hypercall.nr);
+            return -1;
+    }
+
+    return 0;
+}
+
 
 static void kvm_handle_io(uint16_t port, MemTxAttrs attrs, void *data, int direction,
                           int size, uint32_t count)
@@ -1939,6 +2121,7 @@ static void kvm_eat_signals(CPUState *cpu)
     } while (sigismember(&chkset, SIG_IPI));
 }
 
+
 int kvm_cpu_exec(CPUState *cpu)
 {
     struct kvm_run *run = cpu->kvm_run;
@@ -2015,8 +2198,12 @@ int kvm_cpu_exec(CPUState *cpu)
 
         trace_kvm_run_exit(cpu->cpu_index, run->exit_reason);
         switch (run->exit_reason) {
+        case KVM_EXIT_HYPERCALL:
+            DPRINTF("handle_hvm_hypercall\n");
+            ret = kvm_handle_hvm_hcall(run);
+            break;
         case KVM_EXIT_IO:
-            DPRINTF("handle_io\n");
+            //DPRINTF("handle_io\n");
             /* Called outside BQL */
             kvm_handle_io(run->io.port, attrs,
                           (uint8_t *)run + run->io.data_offset,
