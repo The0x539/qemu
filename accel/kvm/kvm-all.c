@@ -1953,6 +1953,11 @@ static void kvm_handle_io(uint16_t port, MemTxAttrs attrs, void *data, int direc
     int i;
     uint8_t *ptr = data;
 
+    if (port == 0x7c4) {
+        DPRINTF("Got access to magic HVM port (dir=%d, data=%x, size=%d, count=%d\n",
+                direction, *(uint8_t*)data, size, count);
+        return;
+    }
     for (i = 0; i < count; i++) {
         address_space_rw(&address_space_io, port, attrs,
                          ptr, size,
@@ -2213,7 +2218,7 @@ int kvm_cpu_exec(CPUState *cpu)
             ret = 0;
             break;
         case KVM_EXIT_MMIO:
-            DPRINTF("handle_mmio\n");
+            //DPRINTF("handle_mmio\n");
             /* Called outside BQL */
             address_space_rw(&address_space_memory,
                              run->mmio.phys_addr, attrs,
