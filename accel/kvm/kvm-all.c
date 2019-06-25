@@ -1946,6 +1946,42 @@ static int kvm_handle_hvm_hcall(struct kvm_run * run)
     return 0;
 }
 
+#define HVM_DEL_MAGIC_PORT 0x7C4
+#define HVM_DEL_REQ_FOO 0x1
+
+struct hvm_del_req {
+    uint64_t foo;
+    int bar;
+    uint64_t baz;
+};
+
+static void *kvm_translate_gva(CPUState *cpu, uint64_t gva)
+{
+    struct kvm_translation tl = {.linear_address = gva, .valid = 0};
+    /*int ret = */kvm_vcpu_ioctl(cpu, KVM_TRANSLATE, &tl);
+    //printf("KVM_TRANSLATE returned %d (valid = %d)\n", ret, tl.valid);
+    uint64_t gpa = tl.physical_address;
+    //printf("gpa = 0x%lx\n", gpa);
+    hwaddr xlat, len;
+    MemoryRegion *mr = address_space_translate(cpu->as, gpa, &xlat, &len, false, MEMTXATTRS_UNSPECIFIED);
+    void *base = memory_region_get_ram_ptr(mr);
+    return base + gpa;
+}
+
+static void kvm_hvm_handle_ros(CPUState *cpu, uint32_t req_id, struct hvm_del_req *req)
+{
+    printf("kvm_hvm_handle_ros(%u, 0x%lx)\n", req_id, (uint64_t)req);
+    printf("foo = \"%s\", bar = %d, baz = \"%s\"\n", (char*)kvm_translate_gva(cpu, req->foo), req->bar, (char*)kvm_translate_gva(cpu, req->baz));
+}
+
+static void kvm_hvm_marshal_ros(uint32_t req_id, CPUState *cpu)
+{
+    struct kvm_regs regs;
+    /*int ret = */kvm_vcpu_ioctl(cpu, KVM_GET_REGS, &regs);
+    //printf("KVM_GET_REGS returned %d\n", ret);
+    void *hva = kvm_translate_gva(cpu, regs.r8);
+    kvm_hvm_handle_ros(cpu, req_id, hva);
+}
 
 static void kvm_handle_io(uint16_t port, MemTxAttrs attrs, void *data, int direction,
                           int size, uint32_t count)
@@ -1953,11 +1989,6 @@ static void kvm_handle_io(uint16_t port, MemTxAttrs attrs, void *data, int direc
     int i;
     uint8_t *ptr = data;
 
-    if (port == 0x7c4) {
-        DPRINTF("Got access to magic HVM port (dir=%d, data=%x, size=%d, count=%d\n",
-                direction, *(uint8_t*)data, size, count);
-        return;
-    }
     for (i = 0; i < count; i++) {
         address_space_rw(&address_space_io, port, attrs,
                          ptr, size,
@@ -2208,6 +2239,11 @@ int kvm_cpu_exec(CPUState *cpu)
             ret = kvm_handle_hvm_hcall(run);
             break;
         case KVM_EXIT_IO:
+            if (run->io.port == HVM_DEL_MAGIC_PORT) {
+                uint32_t *data = (void *)run + run->io.data_offset;
+                kvm_hvm_marshal_ros(*data, cpu);
+                break;
+            }
             //DPRINTF("handle_io\n");
             /* Called outside BQL */
             kvm_handle_io(run->io.port, attrs,
